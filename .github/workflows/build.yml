@@ -13,7 +13,6 @@ jobs:
           distribution: temurin
           java-version: 17
 
-
       - name: Proje dosyalarini olustur
         run: |
           mkdir -p proj && cd proj
@@ -227,6 +226,10 @@ jobs:
               private var lastCount = 0L
               private var lastCheck = 0L
               private var lastToast = 0L
+              private var lastBack = 0L
+              private var lastReelsSeen = 0L
+              private var shownText = ""
+              private var shownRed = false
               private var inReels = false
 
               override fun onServiceConnected() {
@@ -247,7 +250,8 @@ jobs:
                       YT_PKG -> Store.YT
                       else -> {
                           if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-                              pkg != "com.android.systemui") {
+                              !pkg.contains("systemui") && !pkg.contains("inputmethod") &&
+                              !pkg.contains("keyboard")) {
                               inReels = false
                               hide()
                           }
@@ -260,7 +264,14 @@ jobs:
 
                   if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || now - lastCheck > 250) {
                       lastCheck = now
-                      inReels = detect(if (app == Store.IG) IG_IDS else YT_IDS)
+                      val r = detect(if (app == Store.IG) IG_IDS else YT_IDS)
+                      if (r == true) {
+                          inReels = true
+                          lastReelsSeen = now
+                      } else if (r == false && now - lastReelsSeen > 1500) {
+                          // Reels kısa süre görünmediyse hemen kapatma (titremeyi önler)
+                          inReels = false
+                      }
                   }
 
                   if (!inReels) { hide(); return }
@@ -276,7 +287,7 @@ jobs:
                           lastToast = now
                           Toast.makeText(this, "Günlük $label limitin doldu", Toast.LENGTH_SHORT).show()
                       }
-                      performGlobalAction(GLOBAL_ACTION_HOME)
+                      goBack(now)
                       return
                   }
 
@@ -286,15 +297,23 @@ jobs:
                       count = Store.inc(this, app)
                       if (count >= limit) {
                           show("$label limiti doldu ($count/$limit)", true)
-                          performGlobalAction(GLOBAL_ACTION_HOME)
+                          goBack(now)
                           return
                       }
                   }
                   show("$label: $count / $limit", false)
               }
 
-              private fun detect(ids: List<String>): Boolean {
-                  val root = rootInActiveWindow ?: return false
+              // Reels'ten "geri" ile çık; Instagram/YouTube açık kalır. Art arda geri basmayı önlemek için bekleme süresi var.
+              private fun goBack(now: Long) {
+                  if (now - lastBack > 1000) {
+                      lastBack = now
+                      performGlobalAction(GLOBAL_ACTION_BACK)
+                  }
+              }
+
+              private fun detect(ids: List<String>): Boolean? {
+                  val root = rootInActiveWindow ?: return null
                   if (DEBUG) dump(root)
                   for (id in ids) {
                       if (root.findAccessibilityNodeInfosByViewId(id).isNotEmpty()) return true
@@ -329,7 +348,12 @@ jobs:
                       }
                       manager.addView(tv, lp)
                       overlay = tv
+                      shownText = ""
                   }
+                  // Aynı içeriği tekrar çizme (titremeyi önler)
+                  if (text == shownText && red == shownRed) return
+                  shownText = text
+                  shownRed = red
                   overlay?.apply {
                       this.text = text
                       background = GradientDrawable().apply {
@@ -343,6 +367,7 @@ jobs:
                   val v = overlay ?: return
                   try { wm?.removeView(v) } catch (_: Exception) {}
                   overlay = null
+                  shownText = ""
               }
           }
           RLEOF
