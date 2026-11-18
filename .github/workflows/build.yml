@@ -1,0 +1,434 @@
+name: APK Derle
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'RLEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.reelslimiter"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.reelslimiter"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          RLEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'RLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ReelsService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          RLEOF
+          mkdir -p app/src/main/java/com/example/reelslimiter
+          cat > app/src/main/java/com/example/reelslimiter/MainActivity.kt <<'RLEOF'
+          package com.example.reelslimiter
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var igInfo: TextView
+              private lateinit var ytInfo: TextView
+              private lateinit var igLimit: EditText
+              private lateinit var ytLimit: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (20 * d).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  fun text(size: Float, bold: Boolean = false) = TextView(this).apply {
+                      textSize = size
+                      if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+                      setPadding(0, pad / 2, 0, pad / 2)
+                  }
+
+                  root.addView(text(24f, true).apply { this.text = "Reels Sınırı" })
+                  status = text(15f).also { root.addView(it) }
+
+                  root.addView(Button(this).apply {
+                      text = "Erişilebilirlik ayarlarını aç"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+
+                  root.addView(text(18f, true).apply { this.text = "Bugün" })
+                  igInfo = text(16f).also { root.addView(it) }
+                  ytInfo = text(16f).also { root.addView(it) }
+
+                  root.addView(text(18f, true).apply { this.text = "Günlük sınır" })
+
+                  fun limitField(hint: String): EditText = EditText(this).apply {
+                      this.hint = hint
+                      inputType = InputType.TYPE_CLASS_NUMBER
+                  }
+                  igLimit = limitField("Instagram Reels sınırı").also { root.addView(it) }
+                  ytLimit = limitField("YouTube Shorts sınırı").also { root.addView(it) }
+
+                  root.addView(Button(this).apply {
+                      text = "Kaydet"
+                      setOnClickListener {
+                          val ig = igLimit.text.toString().toIntOrNull()
+                          val yt = ytLimit.text.toString().toIntOrNull()
+                          if (ig == null || yt == null || ig < 0 || yt < 0) {
+                              Toast.makeText(context, "Geçerli sayılar gir", Toast.LENGTH_SHORT).show()
+                          } else {
+                              Store.setLimit(context, Store.IG, ig)
+                              Store.setLimit(context, Store.YT, yt)
+                              Toast.makeText(context, "Kaydedildi", Toast.LENGTH_SHORT).show()
+                              refresh()
+                          }
+                      }
+                  })
+
+                  setContentView(ScrollView(this).apply {
+                      layoutParams = ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                      addView(root)
+                  })
+
+                  igLimit.setText(Store.limit(this, Store.IG).toString())
+                  ytLimit.setText(Store.limit(this, Store.YT).toString())
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+
+              private fun serviceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+                  return enabled.contains("$packageName/")
+              }
+
+              private fun refresh() {
+                  status.text = if (serviceEnabled())
+                      "Durum: Açık ✅" else "Durum: Kapalı ❌ (aşağıdan servisi etkinleştir)"
+                  igInfo.text = "Instagram Reels: ${Store.count(this, Store.IG)} / ${Store.limit(this, Store.IG)}"
+                  ytInfo.text = "YouTube Shorts: ${Store.count(this, Store.YT)} / ${Store.limit(this, Store.YT)}"
+              }
+          }
+          RLEOF
+          mkdir -p app/src/main/java/com/example/reelslimiter
+          cat > app/src/main/java/com/example/reelslimiter/ReelsService.kt <<'RLEOF'
+          package com.example.reelslimiter
+
+          import android.accessibilityservice.AccessibilityService
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.SystemClock
+          import android.util.Log
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class ReelsService : AccessibilityService() {
+
+              companion object {
+                  const val IG_PKG = "com.instagram.android"
+                  const val YT_PKG = "com.google.android.youtube"
+
+                  // Reels / Shorts ekranını tanıyan görünüm kimlikleri.
+                  // Uygulama güncellemeleriyle değişebilir; DEBUG = true yapıp Logcat'te "ReelsDump" etiketine bak.
+                  val IG_IDS = listOf(
+                      "com.instagram.android:id/clips_viewer_view_pager",
+                      "com.instagram.android:id/clips_swipe_refresh_container",
+                      "com.instagram.android:id/clips_viewer_video_layout"
+                  )
+                  val YT_IDS = listOf(
+                      "com.google.android.youtube:id/reel_recycler",
+                      "com.google.android.youtube:id/reel_player_page_container",
+                      "com.google.android.youtube:id/shorts_container"
+                  )
+                  const val DEBUG = false
+              }
+
+              private var wm: WindowManager? = null
+              private var overlay: TextView? = null
+              private var lastCount = 0L
+              private var lastCheck = 0L
+              private var lastToast = 0L
+              private var inReels = false
+
+              override fun onServiceConnected() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onInterrupt() { hide() }
+
+              override fun onDestroy() {
+                  hide()
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val pkg = e.packageName?.toString() ?: return
+                  val app = when (pkg) {
+                      IG_PKG -> Store.IG
+                      YT_PKG -> Store.YT
+                      else -> {
+                          if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                              pkg != "com.android.systemui") {
+                              inReels = false
+                              hide()
+                          }
+                          return
+                      }
+                  }
+
+                  val now = SystemClock.uptimeMillis()
+                  val type = e.eventType
+
+                  if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || now - lastCheck > 250) {
+                      lastCheck = now
+                      inReels = detect(if (app == Store.IG) IG_IDS else YT_IDS)
+                  }
+
+                  if (!inReels) { hide(); return }
+
+                  val label = if (app == Store.IG) "Reels" else "Shorts"
+                  val limit = Store.limit(this, app)
+                  var count = Store.count(this, app)
+
+                  // Limit dolduysa: Reels/Shorts içinde kalmaya izin verme
+                  if (count >= limit) {
+                      show("$label limiti doldu ($count/$limit)", true)
+                      if (now - lastToast > 2000) {
+                          lastToast = now
+                          Toast.makeText(this, "Günlük $label limitin doldu", Toast.LENGTH_SHORT).show()
+                      }
+                      performGlobalAction(GLOBAL_ACTION_HOME)
+                      return
+                  }
+
+                  // Her kaydırma birden çok olay üretir; 700 ms içindekileri tek say
+                  if (type == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastCount > 700) {
+                      lastCount = now
+                      count = Store.inc(this, app)
+                      if (count >= limit) {
+                          show("$label limiti doldu ($count/$limit)", true)
+                          performGlobalAction(GLOBAL_ACTION_HOME)
+                          return
+                      }
+                  }
+                  show("$label: $count / $limit", false)
+              }
+
+              private fun detect(ids: List<String>): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  if (DEBUG) dump(root)
+                  for (id in ids) {
+                      if (root.findAccessibilityNodeInfosByViewId(id).isNotEmpty()) return true
+                  }
+                  return false
+              }
+
+              private fun dump(n: AccessibilityNodeInfo?, depth: Int = 0) {
+                  if (n == null || depth > 12) return
+                  n.viewIdResourceName?.let { Log.d("ReelsDump", it) }
+                  for (i in 0 until n.childCount) dump(n.getChild(i), depth + 1)
+              }
+
+              private fun show(text: String, red: Boolean) {
+                  val manager = wm ?: return
+                  if (overlay == null) {
+                      val tv = TextView(this).apply {
+                          setTextColor(Color.WHITE)
+                          textSize = 14f
+                          setPadding(36, 14, 36, 14)
+                      }
+                      val lp = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                          PixelFormat.TRANSLUCENT
+                      ).apply {
+                          gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                          y = 140
+                      }
+                      manager.addView(tv, lp)
+                      overlay = tv
+                  }
+                  overlay?.apply {
+                      this.text = text
+                      background = GradientDrawable().apply {
+                          cornerRadius = 60f
+                          setColor(if (red) 0xDDC62828.toInt() else 0xCC000000.toInt())
+                      }
+                  }
+              }
+
+              private fun hide() {
+                  val v = overlay ?: return
+                  try { wm?.removeView(v) } catch (_: Exception) {}
+                  overlay = null
+              }
+          }
+          RLEOF
+          mkdir -p app/src/main/java/com/example/reelslimiter
+          cat > app/src/main/java/com/example/reelslimiter/Store.kt <<'RLEOF'
+          package com.example.reelslimiter
+
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Store {
+              const val IG = "ig"
+              const val YT = "yt"
+
+              private fun sp(c: Context) = c.getSharedPreferences("reels", Context.MODE_PRIVATE)
+              private fun today() = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+              fun count(c: Context, app: String): Int = sp(c).getInt("count_${app}_${today()}", 0)
+
+              fun inc(c: Context, app: String): Int {
+                  val n = count(c, app) + 1
+                  sp(c).edit().putInt("count_${app}_${today()}", n).apply()
+                  return n
+              }
+
+              fun limit(c: Context, app: String): Int = sp(c).getInt("limit_$app", 50)
+
+              fun setLimit(c: Context, app: String, v: Int) {
+                  sp(c).edit().putInt("limit_$app", v).apply()
+              }
+          }
+          RLEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'RLEOF'
+          <resources>
+              <string name="app_name">Reels Sınırı</string>
+              <string name="service_desc">Instagram Reels ve YouTube Shorts kaydırmalarını sayar ve günlük sınıra ulaşınca engeller. Hiçbir veri telefondan çıkmaz.</string>
+          </resources>
+          RLEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'RLEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewScrolled|typeWindowContentChanged|typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_desc" />
+          RLEOF
+          cat > build.gradle.kts <<'RLEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          RLEOF
+          cat > gradle.properties <<'RLEOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          RLEOF
+          cat > settings.gradle.kts <<'RLEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ReelsLimiter"
+          include(":app")
+          RLEOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: APK derle
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReelsLimiter-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
+
