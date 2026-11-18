@@ -81,6 +81,9 @@ jobs:
           package com.example.reelslimiter
 
           import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
           import android.content.Intent
           import android.os.Bundle
           import android.provider.Settings
@@ -100,6 +103,7 @@ jobs:
               private lateinit var ytInfo: TextView
               private lateinit var igLimit: EditText
               private lateinit var ytLimit: EditText
+              private lateinit var diagBtn: Button
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -154,6 +158,30 @@ jobs:
                       }
                   })
 
+                  root.addView(text(18f, true).apply { this.text = "Teşhis (sorun olursa)" })
+                  diagBtn = Button(this).apply {
+                      setOnClickListener {
+                          Store.setDiag(context, !Store.diagOn(context))
+                          refresh()
+                      }
+                  }
+                  root.addView(diagBtn)
+                  root.addView(Button(this).apply {
+                      text = "Teşhis kaydını kopyala"
+                      setOnClickListener {
+                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("teshis", Store.dumps(context)))
+                          Toast.makeText(context, "Kopyalandı", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Teşhis kaydını temizle"
+                      setOnClickListener {
+                          Store.clearDumps(context)
+                          Toast.makeText(context, "Temizlendi", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+
                   setContentView(ScrollView(this).apply {
                       layoutParams = ViewGroup.LayoutParams(
                           ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -178,6 +206,7 @@ jobs:
               private fun refresh() {
                   status.text = if (serviceEnabled())
                       "Durum: Açık ✅" else "Durum: Kapalı ❌ (aşağıdan servisi etkinleştir)"
+                  diagBtn.text = if (Store.diagOn(this)) "Teşhis modu: AÇIK (kapatmak için dokun)" else "Teşhis modu: kapalı (açmak için dokun)"
                   igInfo.text = "Instagram Reels: ${Store.count(this, Store.IG)} / ${Store.limit(this, Store.IG)}"
                   ytInfo.text = "YouTube Shorts: ${Store.count(this, Store.YT)} / ${Store.limit(this, Store.YT)}"
               }
@@ -190,9 +219,9 @@ jobs:
           import android.accessibilityservice.AccessibilityService
           import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.graphics.Rect
           import android.graphics.drawable.GradientDrawable
           import android.os.SystemClock
-          import android.util.Log
           import android.view.Gravity
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
@@ -206,8 +235,8 @@ jobs:
                   const val IG_PKG = "com.instagram.android"
                   const val YT_PKG = "com.google.android.youtube"
 
-                  // Reels / Shorts ekranını tanıyan görünüm kimlikleri.
-                  // Uygulama güncellemeleriyle değişebilir; DEBUG = true yapıp Logcat'te "ReelsDump" etiketine bak.
+                  // Reels / Shorts kaydırma listesini tanıyan görünüm kimlikleri.
+                  // Uygulama güncellemeleriyle değişebilir; uygulamadaki "Teşhis" bölümü doğru kimliği bulmaya yarar.
                   val IG_IDS = listOf(
                       "com.instagram.android:id/clips_viewer_view_pager",
                       "com.instagram.android:id/clips_swipe_refresh_container",
@@ -218,7 +247,6 @@ jobs:
                       "com.google.android.youtube:id/reel_player_page_container",
                       "com.google.android.youtube:id/shorts_container"
                   )
-                  const val DEBUG = false
               }
 
               private var wm: WindowManager? = null
@@ -228,6 +256,7 @@ jobs:
               private var lastToast = 0L
               private var lastBack = 0L
               private var lastReelsSeen = 0L
+              private var lastDiag = 0L
               private var shownText = ""
               private var shownRed = false
               private var inReels = false
@@ -245,6 +274,10 @@ jobs:
 
               override fun onAccessibilityEvent(e: AccessibilityEvent) {
                   val pkg = e.packageName?.toString() ?: return
+
+                  // Kendi sayaç kutumuzun olayları (titremenin sebebi buydu) yok sayılır
+                  if (pkg == packageName) return
+
                   val app = when (pkg) {
                       IG_PKG -> Store.IG
                       YT_PKG -> Store.YT
@@ -259,17 +292,19 @@ jobs:
                       }
                   }
 
+                  val ids = if (app == Store.IG) IG_IDS else YT_IDS
                   val now = SystemClock.uptimeMillis()
                   val type = e.eventType
 
+                  diag(app, now)
+
                   if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || now - lastCheck > 250) {
                       lastCheck = now
-                      val r = detect(if (app == Store.IG) IG_IDS else YT_IDS)
+                      val r = detect(ids)
                       if (r == true) {
                           inReels = true
                           lastReelsSeen = now
                       } else if (r == false && now - lastReelsSeen > 1500) {
-                          // Reels kısa süre görünmediyse hemen kapatma (titremeyi önler)
                           inReels = false
                       }
                   }
@@ -280,7 +315,6 @@ jobs:
                   val limit = Store.limit(this, app)
                   var count = Store.count(this, app)
 
-                  // Limit dolduysa: Reels/Shorts içinde kalmaya izin verme
                   if (count >= limit) {
                       show("$label limiti doldu ($count/$limit)", true)
                       if (now - lastToast > 2000) {
@@ -291,8 +325,9 @@ jobs:
                       return
                   }
 
-                  // Her kaydırma birden çok olay üretir; 700 ms içindekileri tek say
-                  if (type == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastCount > 700) {
+                  // Sadece Reels/Shorts listesinden gelen kaydırmalar sayılır (sohbet, gönderi kaydırmaları sayılmaz)
+                  if (type == AccessibilityEvent.TYPE_VIEW_SCROLLED &&
+                      now - lastCount > 700 && fromReels(e.source, ids)) {
                       lastCount = now
                       count = Store.inc(this, app)
                       if (count >= limit) {
@@ -304,7 +339,6 @@ jobs:
                   show("$label: $count / $limit", false)
               }
 
-              // Reels'ten "geri" ile çık; Instagram/YouTube açık kalır. Art arda geri basmayı önlemek için bekleme süresi var.
               private fun goBack(now: Long) {
                   if (now - lastBack > 1000) {
                       lastBack = now
@@ -312,19 +346,59 @@ jobs:
                   }
               }
 
-              private fun detect(ids: List<String>): Boolean? {
-                  val root = rootInActiveWindow ?: return null
-                  if (DEBUG) dump(root)
-                  for (id in ids) {
-                      if (root.findAccessibilityNodeInfosByViewId(id).isNotEmpty()) return true
+              // Olayın kaynağı (ya da üst öğelerinden biri) Reels listesi mi?
+              private fun fromReels(src: AccessibilityNodeInfo?, ids: List<String>): Boolean {
+                  var n = src
+                  var i = 0
+                  while (n != null && i < 8) {
+                      val id = n.viewIdResourceName
+                      if (id != null && id in ids) return true
+                      n = n.parent
+                      i++
                   }
                   return false
               }
 
-              private fun dump(n: AccessibilityNodeInfo?, depth: Int = 0) {
-                  if (n == null || depth > 12) return
-                  n.viewIdResourceName?.let { Log.d("ReelsDump", it) }
-                  for (i in 0 until n.childCount) dump(n.getChild(i), depth + 1)
+              // true: Reels ekranı görünür, false: görünmüyor, null: ekran bilgisi okunamadı
+              private fun detect(ids: List<String>): Boolean? {
+                  val root = rootInActiveWindow ?: return null
+                  val h = resources.displayMetrics.heightPixels
+                  val r = Rect()
+                  for (id in ids) {
+                      for (n in root.findAccessibilityNodeInfosByViewId(id)) {
+                          if (!n.isVisibleToUser) continue
+                          n.getBoundsInScreen(r)
+                          if (r.height() >= h * 0.6) return true
+                      }
+                  }
+                  return false
+              }
+
+              // ---- Teşhis: ekrandaki görünüm kimliklerini kaydeder ----
+              private fun diag(app: String, now: Long) {
+                  if (!Store.diagOn(this)) return
+                  if (now - lastDiag < 1500) return
+                  lastDiag = now
+                  val root = rootInActiveWindow ?: return
+                  val h = resources.displayMetrics.heightPixels
+                  val lines = HashSet<String>()
+                  collect(root, h, lines, 0)
+                  val marked = lines.filter { it.contains("BIG") || it.contains("SEL") }.sorted()
+                  val others = lines.filter { !it.contains("BIG") && !it.contains("SEL") }.sorted().take(40)
+                  Store.addDump(this, app, marked.joinToString("|"), (marked + others).joinToString("\n"))
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, h: Int, out: MutableSet<String>, d: Int) {
+                  if (n == null || d > 30) return
+                  val id = n.viewIdResourceName
+                  if (id != null && n.isVisibleToUser) {
+                      val r = Rect()
+                      n.getBoundsInScreen(r)
+                      val big = if (r.height() >= h * 0.6) " BIG" else ""
+                      val sel = if (n.isSelected) " SEL" else ""
+                      out.add(id.substringAfter(":id/") + big + sel)
+                  }
+                  for (i in 0 until n.childCount) collect(n.getChild(i), h, out, d + 1)
               }
 
               private fun show(text: String, red: Boolean) {
@@ -350,7 +424,6 @@ jobs:
                       overlay = tv
                       shownText = ""
                   }
-                  // Aynı içeriği tekrar çizme (titremeyi önler)
                   if (text == shownText && red == shownRed) return
                   shownText = text
                   shownRed = red
@@ -383,6 +456,7 @@ jobs:
           object Store {
               const val IG = "ig"
               const val YT = "yt"
+              private const val SEP = "\n=====\n"
 
               private fun sp(c: Context) = c.getSharedPreferences("reels", Context.MODE_PRIVATE)
               private fun today() = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -399,6 +473,29 @@ jobs:
 
               fun setLimit(c: Context, app: String, v: Int) {
                   sp(c).edit().putInt("limit_$app", v).apply()
+              }
+
+              // ---- Teşhis modu ----
+              fun diagOn(c: Context): Boolean = sp(c).getBoolean("diag", false)
+
+              fun setDiag(c: Context, v: Boolean) {
+                  sp(c).edit().putBoolean("diag", v).apply()
+              }
+
+              fun dumps(c: Context): String = sp(c).getString("dumps", "") ?: ""
+
+              fun clearDumps(c: Context) {
+                  sp(c).edit().remove("dumps").remove("dump_sig").apply()
+              }
+
+              fun addDump(c: Context, app: String, sig: String, body: String) {
+                  val s = sp(c)
+                  if (s.getString("dump_sig", "") == sig) return
+                  val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  val list = (s.getString("dumps", "") ?: "").split(SEP).filter { it.isNotBlank() }.toMutableList()
+                  list.add("[$time $app]\n$body")
+                  while (list.size > 6) list.removeAt(0)
+                  s.edit().putString("dumps", list.joinToString(SEP)).putString("dump_sig", sig).apply()
               }
           }
           RLEOF
